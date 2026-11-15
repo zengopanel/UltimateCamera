@@ -1,0 +1,165 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-15T00:00:00Z",
+  "title": "Design System: Ultimate Camera",
+  "extensions": {
+    "colorMeta": {
+      "primary": {
+        "role": "primary",
+        "displayName": "Satin Brass",
+        "tonalRamp": ["#2B2112", "#4E3A20", "#71552D", "#94703B", "#B68D50", "#CAA86B", "#E2C58A", "#F8E8C9"]
+      },
+      "primary-deep": {
+        "role": "secondary",
+        "displayName": "Deep Brass",
+        "tonalRamp": ["#20170C", "#3F2B13", "#5F411A", "#7D5723", "#A98548", "#C09A58", "#D8B66F", "#F2D99F"]
+      },
+      "neutral-black": {
+        "role": "neutral",
+        "displayName": "Obsidian",
+        "tonalRamp": ["#000000", "#141414", "#292929", "#3D3D3D", "#525252", "#666666", "#7A7A7A", "#8F8F8F"]
+      },
+      "neutral-ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "tonalRamp": ["#090909", "#1D1D1D", "#323232", "#464646", "#5B5B5B", "#6F6F6F", "#848484", "#989898"]
+      },
+      "neutral-control": {
+        "role": "neutral",
+        "displayName": "Control Glass",
+        "tonalRamp": ["#151514", "#292928", "#3E3E3D", "#525251", "#676766", "#7B7B7A", "#90908F", "#A4A4A3"]
+      },
+      "neutral-white": {
+        "role": "neutral",
+        "displayName": "Pearl",
+        "tonalRamp": ["#262626", "#3B3B3B", "#4F4F4F", "#646464", "#787878", "#8D8D8D", "#A1A1A1", "#FFFFFF"]
+      },
+      "text-muted": {
+        "role": "neutral",
+        "displayName": "Muted Pearl",
+        "tonalRamp": ["#242320", "#393835", "#4D4C49", "#62615D", "#767571", "#8B8985", "#9F9D99", "#B4B0A8"]
+      },
+      "recording": {
+        "role": "tertiary",
+        "displayName": "Recording Red",
+        "tonalRamp": ["#2C080B", "#4A1015", "#68181E", "#862027", "#A42831", "#C33640", "#E2444F", "#FF9CA2"]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Countdown",
+        "purpose": "Large self-timer numeral only."
+      },
+      "body": {
+        "displayName": "Camera status",
+        "purpose": "Short live status and transient messages."
+      },
+      "label": {
+        "displayName": "Instrument labels",
+        "purpose": "Compact mode and exposure-control labels."
+      }
+    },
+    "shadows": [],
+    "motion": [
+      {
+        "name": "press-response",
+        "value": "90ms press / 240-280ms release",
+        "purpose": "Compress a camera control on touch and return it with a restrained spring."
+      },
+      {
+        "name": "mode-glide",
+        "value": "240ms decelerate",
+        "purpose": "Move the selected mode marker between positions."
+      },
+      {
+        "name": "zoom-transition",
+        "value": "400ms decelerate",
+        "purpose": "Animate between zoom stops."
+      }
+    ],
+    "breakpoints": [],
+    "elevation": {
+      "strategy": "Flat controls over the live preview; translucent scrims preserve readability. No component shadow system."
+    }
+  },
+  "components": [
+    {
+      "name": "Camera control",
+      "kind": "button",
+      "refersTo": "camera-control",
+      "description": "A circular 48dp capability-aware top control with brass active state.",
+      "html": "<button class=\"ds-control\" aria-label=\"Camera control\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"7\"/><circle cx=\"12\" cy=\"12\" r=\"2\"/></svg></button>",
+      "css": ".ds-control { width: 48px; height: 48px; border: 0; border-radius: 50%; background: rgba(21,21,20,.8); color: #fff; display: grid; place-items: center; transition: transform 90ms ease-out, color 180ms ease-out; } .ds-control svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; } .ds-control:hover, .ds-control:focus-visible { color: #E2C58A; } .ds-control:focus-visible { outline: 2px solid #E2C58A; outline-offset: 3px; } .ds-control:active { transform: scale(.9); }"
+    },
+    {
+      "name": "Photo shutter",
+      "kind": "button",
+      "refersTo": "photo-shutter",
+      "description": "The single primary capture action.",
+      "html": "<button class=\"ds-shutter\" aria-label=\"Take photo\"><span></span></button>",
+      "css": ".ds-shutter { width: 82px; height: 82px; border: 4px solid #fff; border-radius: 50%; background: transparent; display: grid; place-items: center; transition: transform 90ms ease-out; } .ds-shutter span { width: 62px; height: 62px; border-radius: 50%; background: #fff; } .ds-shutter:focus-visible { outline: 2px solid #E2C58A; outline-offset: 4px; } .ds-shutter:active { transform: scale(.94); }"
+    },
+    {
+      "name": "Mode rail",
+      "kind": "nav",
+      "refersTo": "mode-selected",
+      "description": "A compact capsule for supported Photo, Video, and Pro modes.",
+      "html": "<nav class=\"ds-mode-rail\" aria-label=\"Camera mode\"><span>PHOTO</span><span class=\"ds-mode-active\">VIDEO</span><span>PRO</span></nav>",
+      "css": ".ds-mode-rail { min-height: 48px; display: flex; align-items: center; gap: 2px; padding: 2px; border-radius: 18px; background: rgba(17,17,16,.72); color: #B4B0A8; font: 500 13px/1 Roboto, sans-serif; letter-spacing: .16em; } .ds-mode-rail span { flex: 1; text-align: center; padding: 16px 10px; border-radius: 16px; } .ds-mode-rail .ds-mode-active { color: #E2C58A; background: rgba(51,43,30,.27); } .ds-mode-rail span:focus-visible { outline: 2px solid #E2C58A; }"
+    },
+    {
+      "name": "Zoom selector",
+      "kind": "custom",
+      "refersTo": "zoom-selector",
+      "description": "A translucent capsule of discovered zoom stops with a moving selection.",
+      "html": "<div class=\"ds-zoom\" role=\"group\" aria-label=\"Zoom\"><button>1×</button><button class=\"ds-zoom-active\">2×</button><button>5×</button></div>",
+      "css": ".ds-zoom { display: flex; gap: 4px; padding: 5px; border-radius: 32px; background: rgba(0,0,0,.5); } .ds-zoom button { min-width: 38px; height: 38px; padding: 0 8px; border: 0; border-radius: 50%; color: #fff; background: transparent; font: 500 12px Roboto, sans-serif; } .ds-zoom .ds-zoom-active { color: #E2C58A; background: rgba(255,255,255,.2); } .ds-zoom button:focus-visible { outline: 2px solid #E2C58A; outline-offset: 2px; }"
+    },
+    {
+      "name": "Pro readout chip",
+      "kind": "chip",
+      "refersTo": "pro-readout",
+      "description": "A label-over-value chip for a real supported exposure parameter.",
+      "html": "<button class=\"ds-pro-chip\"><span>ISO</span><strong>400</strong></button>",
+      "css": ".ds-pro-chip { min-width: 56px; padding: 6px; border: 0; background: transparent; color: #fff; display: grid; gap: 4px; text-align: center; font-family: Roboto, sans-serif; } .ds-pro-chip span { color: #B4B0A8; font-size: 10px; font-weight: 500; letter-spacing: .14em; } .ds-pro-chip strong { color: #E2C58A; font-size: 15px; font-weight: 500; } .ds-pro-chip:focus-visible { outline: 2px solid #E2C58A; border-radius: 8px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Calibrated Instrument",
+    "overview": "The interface treats the phone as a capable camera instrument: the live scene is the work surface, and controls appear only where they help compose, expose, or capture it. A restrained obsidian field lets the viewfinder lead; satin brass marks active choices, pearl carries essential information, and recording red is reserved for video state.\n\nControls are direct, compact, and capability-aware. The system uses familiar Android touch behavior while drawing its custom camera controls in a precise, tactile visual language. The look is informed by flagship camera usability, not copied from another camera app.",
+    "keyCharacteristics": [
+      "Viewfinder-first, full-screen composition.",
+      "Satin-brass active states on a dark neutral field.",
+      "Recording red reserved for video capture state.",
+      "Modes and settings reflect capabilities reported by Camera2."
+    ],
+    "rules": [
+      {
+        "name": "The One Signal Rule",
+        "body": "Brass means an active selection; recording red means video is recording. Do not use either as decoration.",
+        "section": "colors"
+      },
+      {
+        "name": "The Readout Rule",
+        "body": "Use tabular-feeling, concise values for exposure, zoom, timer, and recording state; do not turn technical values into decorative copy.",
+        "section": "typography"
+      },
+      {
+        "name": "The Scene-First Rule",
+        "body": "Keep chrome translucent and sparse; never place an opaque decorative panel over the viewfinder.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do keep the active scene as the dominant visual content.",
+      "Do show capture modes and settings only when the active camera reports support.",
+      "Do use brass for active state and recording red only for recording state.",
+      "Do make focus, exposure, and timer overlays appear only when their action is available."
+    ],
+    "donts": [
+      "Don't claim software video stabilization; only advertised OIS/EIS requests are implemented.",
+      "Don't show a failed camera extension as an active mode.",
+      "Don't add decorative settings cards, gradients, or camera controls that do not change capture behavior; functional contrast scrims are allowed."
+    ]
+  }
+}
