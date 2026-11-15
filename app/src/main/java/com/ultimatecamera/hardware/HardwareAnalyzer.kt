@@ -245,25 +245,18 @@ class HardwareAnalyzer(context: Context) {
         val rawSize = map.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width.toLong() * it.height }
         val hasRaw = CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW in caps && rawSize != null
         val manual = CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR in caps
-        val requestKeys = c.get(CameraCharacteristics.REQUEST_AVAILABLE_REQUEST_KEYS)?.toSet().orEmpty()
         val awbModes = c.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toList().orEmpty()
         val hasColorTransform = c.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1) != null ||
             c.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2) != null
         val manualWhiteBalance =
             CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING in caps &&
                 CameraMetadata.CONTROL_AWB_MODE_OFF in awbModes &&
-                hasColorTransform &&
-                CaptureRequest.CONTROL_AWB_MODE in requestKeys &&
-                CaptureRequest.COLOR_CORRECTION_MODE in requestKeys &&
-                CaptureRequest.COLOR_CORRECTION_GAINS in requestKeys &&
-                CaptureRequest.COLOR_CORRECTION_TRANSFORM in requestKeys
+                hasColorTransform
         val toneCurvePoints = c.get(CameraCharacteristics.TONEMAP_MAX_CURVE_POINTS) ?: 0
         val toneModes = c.get(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES)?.toSet().orEmpty()
         val manualToneCurve =
             CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE in toneModes &&
-                toneCurvePoints >= 2 &&
-                CaptureRequest.TONEMAP_MODE in requestKeys &&
-                CaptureRequest.TONEMAP_CURVE in requestKeys
+            toneCurvePoints >= 2
         val afModes = c.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.toSet().orEmpty()
         val aeLock = c.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true
         val afLock = CameraMetadata.CONTROL_AF_MODE_AUTO in afModes

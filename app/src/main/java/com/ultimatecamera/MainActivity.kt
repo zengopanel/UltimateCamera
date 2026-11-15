@@ -636,7 +636,7 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             gravity = Gravity.CENTER
             setPadding(dpi(18), 0, dpi(18), 0)
             minHeight = dpi(36)
-            setOnClickListener(onClick)
+            setOnClickListener { onClick() }
             addPressFeedback(0.96f)
         }
         proPhotoButton = proSubmodeButton("PRO PHOTO") { setProVideoMode(false) }
