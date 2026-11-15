@@ -22,8 +22,14 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CameraExtensionCharacteristics
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.StatFs
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.util.Size
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -40,11 +46,14 @@ import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import com.ultimatecamera.camera.CameraEngine
 import com.ultimatecamera.camera.ManualSettings
+import com.ultimatecamera.camera.VideoStabilization
 import com.ultimatecamera.hardware.CameraCaps
 import com.ultimatecamera.hardware.HardwareAnalyzer
+import com.ultimatecamera.hardware.VideoCodec
 import com.ultimatecamera.hardware.VideoProfile
 import com.ultimatecamera.ui.AutoFitFrameLayout
 import com.ultimatecamera.ui.FocusRingView
@@ -53,6 +62,8 @@ import com.ultimatecamera.ui.IconType
 import com.ultimatecamera.ui.IconView
 import com.ultimatecamera.ui.ModeSelector
 import com.ultimatecamera.ui.ParamChip
+import com.ultimatecamera.ui.ProMonitorView
+import com.ultimatecamera.ui.FocusPeakingView
 import com.ultimatecamera.ui.RulerSlider
 import com.ultimatecamera.ui.ShutterButton
 import com.ultimatecamera.ui.Theme
@@ -61,6 +72,7 @@ import com.ultimatecamera.ui.addPressFeedback
 import com.ultimatecamera.ui.dp
 import com.ultimatecamera.ui.dpi
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.roundToInt
@@ -68,7 +80,7 @@ import kotlin.math.roundToInt
 class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextureListener {
 
     private enum class Param(val label: String) {
-        ISO("ISO"), SHUTTER("SHUTTER"), FOCUS("FOCUS"), WB("WB"), EV("EV")
+        ISO("ISO"), SHUTTER("SHUTTER"), FOCUS("FOCUS"), WB("WB"), KELVIN("KELVIN"), EV("EV")
     }
 
     companion object {
@@ -97,13 +109,20 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
     private lateinit var zoomBar: ZoomBar
     private lateinit var modeSelector: ModeSelector
     private lateinit var proPanel: LinearLayout
+    private lateinit var proSubmodeBar: LinearLayout
+    private lateinit var proPhotoButton: TextView
+    private lateinit var proVideoButton: TextView
     private lateinit var chipsRow: LinearLayout
     private lateinit var ruler: RulerSlider
+    private lateinit var proActions: LinearLayout
+    private lateinit var monitor: ProMonitorView
+    private lateinit var focusPeaking: FocusPeakingView
     private lateinit var msgPill: TextView
     private lateinit var flashBtn: IconView
     private lateinit var gridBtn: IconView
     private lateinit var hdrBtn: IconView
     private lateinit var stabilizationBtn: IconView
+    private lateinit var stabilizationLabel: TextView
     private lateinit var timerBtn: IconView
     private lateinit var settingsBtn: IconView
     private lateinit var flipBtn: IconView
@@ -119,13 +138,22 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
     private var current: CameraCaps? = null
     private var surfaceTexture: SurfaceTexture? = null
     private var proMode = false
+    private var proVideoMode = false
     private var currentMode = "PHOTO"
+    private var histogramEnabled = true
+    private var peakingEnabled = false
+    private var levelEnabled = true
+    private var recordingReadoutAt = 0L
+    private var storageReadoutAt = 0L
+    private var hasLevelSensor = false
+    private var activityResumed = false
     private var modeItems: List<String> = emptyList()
     private var lastUri: Uri? = null
     private var lastMimeType = "image/jpeg"
     private var timerSeconds = 0
     private var burstEnabled = false
     private var audioEnabled = true
+    private var audioHighQuality = true
     private var pendingAudioVideo = false
     private var recordingStartedAt = 0L
     private var countdownValue = 0
@@ -142,6 +170,69 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
     private var shutterStops: List<Long> = emptyList()
     private var awbItems: List<Pair<Int, String>> = emptyList()
     private var focusLabels: List<String> = emptyList()
+    private var kelvinStops: List<Int> = emptyList()
+    private val sensorManager by lazy { getSystemService(SENSOR_SERVICE) as SensorManager }
+    private val levelSensor: Sensor? by lazy { sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) }
+    private val levelListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            val roll = Math.toDegrees(atan2(event.values[0].toDouble(), event.values[1].toDouble())).toFloat()
+            monitor.setRoll(roll)
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    private val monitorTick = object : Runnable {
+        override fun run() {
+            if (!proMode || !texture.isAvailable || (!histogramEnabled && !(peakingEnabled && !proVideoMode))) return
+            try {
+                val bitmap = texture.getBitmap(160, 90)
+                if (bitmap != null) {
+                    val w = bitmap.width
+                    val h = bitmap.height
+                    val pixels = IntArray(w * h)
+                    bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+                    bitmap.recycle()
+                    val bins = IntArray(48)
+                    for (color in pixels) {
+                        val luma = (Color.red(color) * 0.2126f + Color.green(color) * 0.7152f +
+                            Color.blue(color) * 0.0722f).toInt().coerceIn(0, 255)
+                        bins[luma * bins.size / 256]++
+                    }
+                    if (histogramEnabled) monitor.setHistogram(bins)
+                    if (peakingEnabled && !proVideoMode) focusPeaking.setPoints(findPeakingEdges(pixels, w, h))
+                }
+            } catch (_: IllegalStateException) {
+            }
+            ui.postDelayed(this, 1000)
+        }
+    }
+
+    override fun onAudioLevel(amplitude: Int) {
+        ui.post { monitor.setAudioLevel(amplitude) }
+    }
+
+    override fun onCaptureReadout(iso: Int, exposureNs: Long, focusDiopters: Float) {
+        if (!proMode) return
+        val now = System.currentTimeMillis()
+        if (now - recordingReadoutAt < 400L) return
+        recordingReadoutAt = now
+        ui.post {
+            val c = current ?: return@post
+            val profile = videoProfiles[c.id] ?: c.defaultVideoProfile()
+            val exposure = if (exposureNs > 0) CameraCaps.fmtShutter(exposureNs) else "AUTO"
+            val isoText = if (iso > 0) "ISO $iso" else "ISO AUTO"
+            val focusText = if (engine.settings.manualFocus) "MF" else "AF"
+            monitor.setReadout(
+                listOfNotNull(
+                    profile?.takeIf { proVideoMode }?.let { "${it.size.width}×${it.size.height} ${it.frameRateLabel}" },
+                    isoText,
+                    exposure,
+                    focusText
+                ).joinToString("  ·  ")
+            )
+        }
+    }
 
     // preview gesture state: 0 none, 1 tap, 2 exposure drag, 3 pinch
     private var gesture = 0
@@ -154,6 +245,10 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             if (!engine.isRecording) return
             val seconds = ((System.currentTimeMillis() - recordingStartedAt) / 1000L).toInt()
             recordingBadge.text = "●  REC   %02d:%02d".format(seconds / 60, seconds % 60)
+            if (System.currentTimeMillis() - storageReadoutAt >= 10_000L) {
+                storageReadoutAt = System.currentTimeMillis()
+                monitor.setStorage(availableStorageLabel())
+            }
             ui.postDelayed(this, 1000)
         }
     }
@@ -191,6 +286,10 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
 
     override fun onResume() {
         super.onResume()
+        activityResumed = true
+        if (proMode && levelEnabled && levelSensor != null) {
+            sensorManager.registerListener(levelListener, levelSensor, SensorManager.SENSOR_DELAY_UI)
+        }
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA)
             return
@@ -199,11 +298,14 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
     }
 
     override fun onPause() {
+        activityResumed = false
         zoomAnim?.cancel()
         ui.removeCallbacks(countdownTick)
+        ui.removeCallbacks(monitorTick)
         countdownAction = null
         countdownOverlay.visibility = View.GONE
         ui.removeCallbacks(recordingClock)
+        sensorManager.unregisterListener(levelListener)
         engine.close()
         super.onPause()
     }
@@ -239,7 +341,7 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             ?: c.maxJpeg
         val profile = videoProfiles[c.id]?.takeIf { it in c.videoProfiles } ?: c.defaultVideoProfile()
         if (profile != null) videoProfiles[c.id] = profile
-        val previewTarget = if (currentMode == "VIDEO") profile?.size ?: photoSize else photoSize
+        val previewTarget = if (isVideoCaptureMode()) profile?.size ?: photoSize else photoSize
         val size: Size = c.bestPreview(previewTarget, extensionMode)
         host.setAspectRatio(size.height, size.width) // portrait
         engine.displayRotationDegrees = when (windowManager.defaultDisplay.rotation) {
@@ -250,7 +352,7 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         }
         configureUiForCamera(c)
         engine.open(c, st, size, photoSize, profile, extensionMode)
-        engine.setVideoMode(currentMode == "VIDEO")
+        engine.setVideoMode(isVideoCaptureMode())
     }
 
     override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) = startCamera(st)
@@ -283,8 +385,13 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
                 recordingBadge.animate().alpha(1f).setDuration(180).start()
                 ui.removeCallbacks(recordingClock)
                 ui.post(recordingClock)
+                recordingReadoutAt = 0L
+                storageReadoutAt = 0L
+                monitor.setStorage(availableStorageLabel())
+                updateControlsForMode()
             } else {
                 ui.removeCallbacks(recordingClock)
+                monitor.setAudioLevel(0)
                 updateControlsForMode()
             }
         }
@@ -368,6 +475,11 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         host.addView(grid, FrameLayout.LayoutParams(MATCH, MATCH))
         focusRing = FocusRingView(this)
         host.addView(focusRing, FrameLayout.LayoutParams(MATCH, MATCH))
+        monitor = ProMonitorView(this)
+        monitor.showLevel = false
+        host.addView(monitor, FrameLayout.LayoutParams(MATCH, MATCH))
+        focusPeaking = FocusPeakingView(this).apply { visibility = View.GONE }
+        host.addView(focusPeaking, FrameLayout.LayoutParams(MATCH, MATCH))
         flashOverlay = View(this).apply {
             setBackgroundColor(Color.WHITE)
             alpha = 0f
@@ -403,7 +515,21 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         }
         stabilizationBtn = IconView(this, IconType.STABILIZATION).apply {
             contentDescription = "Video stabilization"
-            setOnClickListener { toggleStabilization() }
+            background = circle(0x44141414)
+            setOnClickListener { cycleStabilization() }
+        }
+        stabilizationLabel = TextView(this).apply {
+            text = "AUTO"
+            textSize = 8f
+            typeface = Theme.MEDIUM
+            gravity = Gravity.CENTER
+            setTextColor(Theme.TEXT_DIM)
+        }
+        val stabilizationControl = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            addView(stabilizationBtn, LinearLayout.LayoutParams(dpi(42), dpi(38)))
+            addView(stabilizationLabel, LinearLayout.LayoutParams(MATCH, dpi(10)))
         }
         timerBtn = IconView(this, IconType.TIMER).apply {
             contentDescription = "Capture timer"
@@ -420,7 +546,9 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         topControl(flashBtn)
         topControl(hdrBtn)
         topBar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-        topControl(stabilizationBtn)
+        topBar.addView(stabilizationControl, LinearLayout.LayoutParams(dpi(48), dpi(48)).apply {
+            marginEnd = dpi(5)
+        })
         topControl(timerBtn)
         topControl(gridBtn)
         topControl(settingsBtn)
@@ -492,6 +620,32 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             visibility = View.GONE
             setPadding(dpi(8), 0, dpi(8), 0)
         }
+        proSubmodeBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dpi(4), dpi(2), dpi(4), dpi(2))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(18f)
+                setColor(0xAA151514.toInt())
+            }
+        }
+        fun proSubmodeButton(title: String, onClick: () -> Unit) = TextView(this).apply {
+            text = title
+            textSize = 11f
+            typeface = Theme.MEDIUM
+            gravity = Gravity.CENTER
+            setPadding(dpi(18), 0, dpi(18), 0)
+            minHeight = dpi(36)
+            setOnClickListener(onClick)
+            addPressFeedback(0.96f)
+        }
+        proPhotoButton = proSubmodeButton("PRO PHOTO") { setProVideoMode(false) }
+        proVideoButton = proSubmodeButton("PRO VIDEO") { setProVideoMode(true) }
+        proSubmodeBar.addView(proPhotoButton, LinearLayout.LayoutParams(0, WRAP, 1f))
+        proSubmodeBar.addView(proVideoButton, LinearLayout.LayoutParams(0, WRAP, 1f))
+        proPanel.addView(proSubmodeBar, LinearLayout.LayoutParams(MATCH, WRAP).apply {
+            bottomMargin = dpi(4)
+        })
         chipsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -499,6 +653,12 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         ruler = RulerSlider(this)
         proPanel.addView(chipsRow, LinearLayout.LayoutParams(MATCH, WRAP))
         proPanel.addView(ruler, LinearLayout.LayoutParams(MATCH, dpi(64)))
+        proActions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dpi(2), 0, dpi(4))
+        }
+        proPanel.addView(proActions, LinearLayout.LayoutParams(MATCH, WRAP))
         bottomStack.addView(proPanel, LinearLayout.LayoutParams(MATCH, WRAP))
 
         modeSelector = ModeSelector(this).apply { onSelected = { onModeSelected(it) } }
@@ -532,7 +692,7 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
                 onShutterAction()
             }
             setOnLongClickListener {
-                if (currentMode == "VIDEO") false else {
+                if (isVideoCaptureMode()) false else {
                     engine.captureBurst(5)
                     toast("5-frame burst")
                     true
@@ -541,6 +701,7 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         }
         flipBtn = IconView(this, IconType.FLIP).apply {
             background = circle(Theme.GLASS)
+            visibility = if (allCaps.size > 1) View.VISIBLE else View.GONE
             setOnClickListener { flipCamera() }
         }
         fun slot(v: View, w: Int, h: Int) = FrameLayout(this).apply {
@@ -579,7 +740,7 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             if (c.videoProfiles.isNotEmpty()) add("VIDEO")
             if (supportsPortrait(c)) add("PORTRAIT")
             if (supportsNight(c)) add("NIGHT")
-            if (hasProControls(c)) add("PRO")
+            if (hasProControls(c) || c.videoProfiles.isNotEmpty()) add("PRO")
         }
         if (currentMode !in modeItems) currentMode = "PHOTO"
         modeSelector.setItems(modeItems, modeItems.indexOf(currentMode))
@@ -592,9 +753,11 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         zoomBar.setStops(stops)
         zoomBar.setZoom(engine.settings.zoom)
 
+        hasLevelSensor = levelSensor != null
         buildProPanel(c)
+        flipBtn.visibility = if (allCaps.size > 1) View.VISIBLE else View.GONE
         flipBtn.isEnabled = allCaps.size > 1
-        flipBtn.alpha = if (flipBtn.isEnabled) 1f else 0.38f
+        flipBtn.alpha = 1f
         updateControlsForMode()
     }
 
@@ -611,9 +774,15 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         )
         return (c.hasManualSensor && c.isoRange != null && c.exposureRangeNs != null) ||
             c.hasManualFocus ||
+            c.hasManualWhiteBalance ||
+            c.hasManualToneCurve ||
             c.awbModes.count { it in whiteBalanceModes } > 1 ||
-            c.evRange.upper > c.evRange.lower
+            c.evRange.upper > c.evRange.lower ||
+            c.hasRaw
     }
+
+    private fun isVideoCaptureMode(): Boolean =
+        currentMode == "VIDEO" || (currentMode == "PRO" && proVideoMode)
 
     private fun extensionModeFor(mode: String, c: CameraCaps): Int? {
         val extension = when (mode) {
@@ -645,16 +814,26 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
 
     private fun updateControlsForMode() {
         val c = current
-        val isVideo = currentMode == "VIDEO"
+        val isVideo = isVideoCaptureMode()
         val extension = c?.let { extensionModeFor(currentMode, it) }
         zoomBar.visibility = if (c != null && c.maxZoom > 1f && canUseZoom(c)) View.VISIBLE else View.GONE
         val flashWorksInMode = currentMode != "PRO" || !engine.settings.manualExposure
         flashBtn.visibility = if (c?.hasFlash == true && extension == null && flashWorksInMode) View.VISIBLE else View.GONE
         hdrBtn.visibility = if (c?.let { supportsHdr(it) } == true && currentMode == "PHOTO") View.VISIBLE else View.GONE
         stabilizationBtn.visibility = if (isVideo) View.VISIBLE else View.GONE
-        stabilizationBtn.isEnabled = c?.let { it.eisSupported || it.oisSupported } == true
+        stabilizationBtn.isEnabled = c?.supportsVideoStabilization == true
         stabilizationBtn.alpha = if (stabilizationBtn.isEnabled) 1f else 0.38f
-        stabilizationBtn.active = isVideo && engine.settings.stabilization && stabilizationBtn.isEnabled
+        val stabilization = c?.let { effectiveStabilization(it) } ?: VideoStabilization.OFF
+        stabilizationBtn.active = isVideo && stabilization != VideoStabilization.OFF
+        stabilizationLabel.text = when {
+            !stabilizationBtn.isEnabled -> "N/A"
+            stabilization == VideoStabilization.OFF -> "OFF"
+            else -> stabilization.name
+        }
+        stabilizationLabel.setTextColor(
+            if (stabilization != VideoStabilization.OFF && stabilizationBtn.isEnabled) Theme.ACCENT
+            else Theme.TEXT_DIM
+        )
         timerBtn.active = timerSeconds > 0
         gridBtn.active = grid.visibility == View.VISIBLE
         flashBtn.active = if (isVideo) engine.settings.torch else engine.settings.flashMode > 0
@@ -663,7 +842,11 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         shutter.recording = engine.isRecording
         hdrBtn.contentDescription = if (engine.settings.hdr) "HDR on" else "HDR off"
         stabilizationBtn.contentDescription = when {
-            stabilizationBtn.isEnabled && engine.settings.stabilization -> "Video stabilization on"
+            stabilizationBtn.isEnabled && stabilization != VideoStabilization.OFF &&
+                engine.settings.stabilization == VideoStabilization.AUTO ->
+                "Automatic video stabilization; ${stabilization.name} active"
+            stabilizationBtn.isEnabled && stabilization != VideoStabilization.OFF ->
+                "Video stabilization ${stabilization.name} active"
             stabilizationBtn.isEnabled -> "Video stabilization off"
             else -> "Video stabilization unavailable"
         }
@@ -680,10 +863,41 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         flipBtn.isEnabled = !engine.isRecording
         modeSelector.isEnabled = !engine.isRecording
         timerBtn.isEnabled = !engine.isRecording
+        proPhotoButton.isEnabled = !engine.isRecording
+        proVideoButton.isEnabled = !engine.isRecording && c?.videoProfiles?.isNotEmpty() == true
+        proPhotoButton.alpha = if (proPhotoButton.isEnabled) 1f else 0.45f
+        proVideoButton.alpha = if (proVideoButton.isEnabled) 1f else 0.45f
+        monitor.showHistogram = proMode && histogramEnabled
+        monitor.showLevel = proMode && levelEnabled && hasLevelSensor
+        monitor.showAudio = proMode && proVideoMode && audioEnabled &&
+            packageManager.hasSystemFeature(PackageManager.FEATURE_MICROPHONE) && engine.isRecording
+        if (activityResumed && proMode && levelEnabled && levelSensor != null) {
+            sensorManager.registerListener(levelListener, levelSensor, SensorManager.SENSOR_DELAY_UI)
+        } else {
+            sensorManager.unregisterListener(levelListener)
+        }
+        focusPeaking.visibility = if (proMode && !proVideoMode && peakingEnabled) View.VISIBLE else View.GONE
+        if (!proMode) monitor.setReadout("")
+        ui.removeCallbacks(monitorTick)
+        if (proMode && (histogramEnabled || (peakingEnabled && !proVideoMode))) ui.post(monitorTick)
+        updateProSubmodeAppearance()
+        updateProActions()
         shutter.contentDescription = if (isVideo) {
             if (engine.isRecording) "Stop video recording" else "Start video recording"
         } else "Take photo"
     }
+
+    private fun effectiveStabilization(c: CameraCaps): VideoStabilization =
+        when (engine.settings.stabilization) {
+            VideoStabilization.AUTO -> when {
+                c.eisSupported -> VideoStabilization.EIS
+                c.oisSupported -> VideoStabilization.OIS
+                else -> VideoStabilization.OFF
+            }
+            VideoStabilization.EIS -> if (c.eisSupported) VideoStabilization.EIS else VideoStabilization.OFF
+            VideoStabilization.OIS -> if (c.oisSupported) VideoStabilization.OIS else VideoStabilization.OFF
+            VideoStabilization.OFF -> VideoStabilization.OFF
+        }
 
     private fun canUseZoom(c: CameraCaps?): Boolean {
         if (c == null) return false
@@ -795,7 +1009,7 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
     private fun toggleTorch() {
         val c = current ?: return
         if (!c.hasFlash) return
-        if (currentMode == "VIDEO") {
+        if (isVideoCaptureMode()) {
             val on = !engine.settings.torch
             engine.settings = engine.settings.copy(torch = on)
             toast(if (on) "Torch on" else "Torch off")
@@ -841,22 +1055,31 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         )
     }
 
-    private fun toggleStabilization() {
+    private fun cycleStabilization() {
         val c = current ?: return
-        if (!c.eisSupported && !c.oisSupported) {
+        if (!c.supportsVideoStabilization) {
             toast("Stabilization is not supported by this camera")
             return
         }
-        val enabled = !engine.settings.stabilization
-        engine.settings = engine.settings.copy(stabilization = enabled)
+        val options = buildList {
+            add(VideoStabilization.AUTO)
+            add(VideoStabilization.OFF)
+            if (c.eisSupported) add(VideoStabilization.EIS)
+            if (c.oisSupported) add(VideoStabilization.OIS)
+        }.distinct()
+        val index = options.indexOf(engine.settings.stabilization).coerceAtLeast(0)
+        val selected = options[(index + 1) % options.size]
+        engine.settings = engine.settings.copy(stabilization = selected)
         engine.updatePreview()
         updateControlsForMode()
-        val source = when {
-            c.eisSupported && c.oisSupported -> "OIS + EIS"
-            c.eisSupported -> "EIS"
-            else -> "OIS"
+        val active = effectiveStabilization(c)
+        val label = when {
+            selected == VideoStabilization.OFF -> "Stabilization off"
+            active == VideoStabilization.OFF -> "Stabilization unavailable"
+            selected == VideoStabilization.AUTO -> "${active.name} stabilization auto"
+            else -> "${active.name} stabilization on"
         }
-        toast(if (enabled) "$source stabilization on" else "Stabilization off")
+        toast(label)
     }
 
     private fun cycleTimer() {
@@ -871,7 +1094,7 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
     }
 
     private fun onShutterAction() {
-        if (currentMode == "VIDEO") {
+        if (isVideoCaptureMode()) {
             if (engine.isRecording) {
                 engine.stopRecording()
                 return
@@ -918,6 +1141,19 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         val actions = ArrayList<Pair<String, () -> Unit>>()
         actions.add("Photo size & aspect ratio" to { showPhotoSizeOptions() })
         if (c.videoProfiles.isNotEmpty()) actions.add("Video resolution & frame rate" to { showVideoProfileOptions() })
+        if (isVideoCaptureMode()) {
+            val profile = videoProfiles[c.id] ?: c.defaultVideoProfile()
+            val codecs = profile?.let { c.videoCodecs[it].orEmpty() }.orEmpty()
+            if (codecs.isNotEmpty()) {
+                actions.add("Video codec: ${engine.settings.videoCodec.label}" to {
+                    if (codecs.size > 1) showVideoCodecOptions()
+                    else toast("${codecs.first().label} is the only supported codec for this profile")
+                })
+            }
+            actions.add("Video bitrate: ${bitrateLabel(engine.settings.videoBitrateFactor)}" to {
+                showVideoBitrateOptions()
+            })
+        }
         actions.add("Burst capture: ${if (burstEnabled) "On" else "Off"}" to {
             burstEnabled = !burstEnabled
             toast(if (burstEnabled) "5-frame burst on" else "Burst off")
@@ -926,10 +1162,27 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             actions.add("Video audio: ${if (audioEnabled) "On" else "Off"}" to {
                 audioEnabled = !audioEnabled
                 toast(if (audioEnabled) "Video audio on" else "Video audio off")
+                updateControlsForMode()
+            })
+            actions.add("Audio quality: ${if (audioHighQuality) "High · 48 kHz / 192 kbps" else "Balanced · 44.1 kHz / 128 kbps"}" to {
+                audioHighQuality = !audioHighQuality
+                engine.settings = engine.settings.copy(
+                    audioSampleRate = if (audioHighQuality) 48_000 else 44_100,
+                    audioBitrate = if (audioHighQuality) 192_000 else 128_000
+                )
+                toast(if (audioHighQuality) "High audio quality" else "Balanced audio quality")
+            })
+        }
+        if (isVideoCaptureMode() && c.supportsVideoStabilization) {
+            actions.add("Video stabilization: ${effectiveStabilization(c).name}" to {
+                cycleStabilization()
             })
         }
         if (c.hasRaw && extensionModeFor(currentMode, c) == null) {
-            actions.add("RAW capture: ${if (engine.settings.raw) "On" else "Off"}" to { toggleRaw() })
+            actions.add("RAW + JPEG: ${if (engine.settings.raw) "On" else "Off"}" to { toggleRaw() })
+        }
+        if (proMode && !proVideoMode && c.hasManualToneCurve) {
+            actions.add("Highlight and shadow tone curve" to { showToneCurveControls() })
         }
         actions.add("Hardware report" to { showInfo() })
         AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
@@ -986,7 +1239,7 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
                 profile.size.width >= 1280 -> "720p"
                 else -> "${profile.size.width}×${profile.size.height}"
             }
-            "$quality · ${profile.fps} FPS"
+            "$quality · ${profile.frameRateLabel}"
         }
         val selected = profiles.indexOf(videoProfiles[c.id]).coerceAtLeast(0)
         AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
@@ -995,12 +1248,53 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
                 val profile = profiles[which]
                 videoProfiles[c.id] = profile
                 engine.setVideoProfile(profile)
+                buildProPanel(c)
                 dialog.dismiss()
                 surfaceTexture?.let { startCamera(it) }
                 toast("Video set to ${labels[which]}")
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    private fun showVideoCodecOptions() {
+        val c = current ?: return
+        val profile = videoProfiles[c.id] ?: c.defaultVideoProfile() ?: return
+        val codecs = c.videoCodecs[profile].orEmpty()
+        if (codecs.isEmpty()) return toast("No supported video encoder for this profile")
+        val selected = codecs.indexOf(engine.settings.videoCodec).coerceAtLeast(0)
+        AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+            .setTitle("Video codec")
+            .setSingleChoiceItems(codecs.map { it.label }.toTypedArray(), selected) { dialog, which ->
+                engine.setVideoCodec(codecs[which])
+                dialog.dismiss()
+                toast("${codecs[which].label} selected")
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showVideoBitrateOptions() {
+        val factors = listOf(0.75f, 1f, 1.35f)
+        val labels = listOf("Efficient", "Standard", "High")
+        val selected = factors.indices.minByOrNull {
+            abs(factors[it] - engine.settings.videoBitrateFactor)
+        } ?: 1
+        AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+            .setTitle("Video bitrate")
+            .setSingleChoiceItems(labels.toTypedArray(), selected) { dialog, which ->
+                engine.setVideoBitrateFactor(factors[which])
+                dialog.dismiss()
+                toast("${labels[which]} bitrate")
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun bitrateLabel(factor: Float) = when {
+        factor < 0.9f -> "Efficient"
+        factor > 1.15f -> "High"
+        else -> "Standard"
     }
 
     private fun toggleGrid() {
@@ -1024,6 +1318,7 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         val on = !engine.settings.raw
         engine.settings = engine.settings.copy(raw = on)
         toast(if (on) "RAW + JPEG" else "JPEG only")
+        if (proMode) updateProActions()
     }
 
     private fun showInfo() {
@@ -1117,12 +1412,12 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             return
         }
         val pro = selectedMode == "PRO"
-        if (pro && chips.isEmpty()) {
+        if (pro && chips.isEmpty() && current?.videoProfiles.isNullOrEmpty()) {
             toast("No manual controls on this camera")
             modeSelector.select(modeItems.indexOf(currentMode), true)
             return
         }
-        val previousMode = currentMode
+        val wasVideoMode = isVideoCaptureMode()
         val previousExtension = current?.let { extensionModeFor(currentMode, it) }
         val extensionMode = current?.let { extensionModeFor(selectedMode, it) }
         currentMode = selectedMode
@@ -1134,6 +1429,9 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
                 manualExposure = false,
                 manualFocus = false,
                 awbMode = CameraMetadata.CONTROL_AWB_MODE_AUTO,
+                manualKelvin = null,
+                aeLocked = false,
+                afLocked = false,
                 raw = engine.settings.raw && extensionMode == null,
                 hdr = selectedMode == "PHOTO" && engine.settings.hdr,
                 night = selectedMode == "NIGHT" && extensionMode == null,
@@ -1141,16 +1439,16 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             )
         }
         val previewConfigurationChanged = previousExtension != extensionMode ||
-            (previousMode == "VIDEO") != (selectedMode == "VIDEO")
+            wasVideoMode != isVideoCaptureMode()
         if (previewConfigurationChanged) {
             surfaceTexture?.let { startCamera(it) } ?: run {
                 engine.setExtensionMode(extensionMode)
-                engine.setVideoMode(selectedMode == "VIDEO")
+                engine.setVideoMode(isVideoCaptureMode())
                 engine.updatePreview()
             }
         } else {
             engine.setExtensionMode(extensionMode)
-            engine.setVideoMode(selectedMode == "VIDEO")
+            engine.setVideoMode(isVideoCaptureMode())
             engine.updatePreview()
         }
         setProVisible(pro)
@@ -1159,6 +1457,33 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             refreshChips()
             selected?.let { selectParam(it) }
         }
+    }
+
+    private fun setProVideoMode(video: Boolean) {
+        if (video && current?.videoProfiles.isNullOrEmpty()) {
+            toast("Video recording is not supported by this camera")
+            return
+        }
+        val wasVideo = isVideoCaptureMode()
+        if (proVideoMode == video) return
+        proVideoMode = video
+        if (video) {
+            val c = current
+            val profile = c?.let { videoProfiles[it.id] ?: it.defaultVideoProfile() }
+            if (profile != null && engine.settings.manualExposure) {
+                val maxShutter = 1_000_000_000L / profile.fps
+                if (engine.settings.shutterNs > maxShutter) {
+                    engine.settings = engine.settings.copy(shutterNs = maxShutter)
+                }
+            }
+        }
+        val isVideo = isVideoCaptureMode()
+        if (wasVideo != isVideo) {
+            surfaceTexture?.let { startCamera(it) } ?: engine.setVideoMode(isVideo)
+        }
+        current?.let { buildProPanel(it) }
+        updateControlsForMode()
+        selected?.let { selectParam(it) }
     }
 
     private fun setProVisible(show: Boolean) {
@@ -1170,6 +1495,8 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             proPanel.animate().alpha(1f).translationY(0f).setDuration(240)
                 .setInterpolator(DecelerateInterpolator()).start()
         } else {
+            ui.removeCallbacks(monitorTick)
+            focusPeaking.setPoints(FloatArray(0))
             proPanel.animate().alpha(0f).translationY(dp(20f)).setDuration(180)
                 .withEndAction { if (!proMode) proPanel.visibility = View.GONE }.start()
         }
@@ -1183,8 +1510,10 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         if (c.hasManualSensor && iso != null && ex != null) {
             isoStops = ISO_BASE.filter { it >= iso.lower && it <= iso.upper }
                 .ifEmpty { listOf(iso.lower, iso.upper).distinct() }
-            shutterStops = SHUTTER_BASE_NS.filter { it >= ex.lower && it <= ex.upper }
-                .ifEmpty { listOf(ex.lower, ex.upper).distinct() }
+            val selectedFps = (videoProfiles[c.id] ?: c.defaultVideoProfile())?.fps ?: 30
+            val maxShutter = if (proVideoMode) minOf(ex.upper, 1_000_000_000L / selectedFps) else ex.upper
+            shutterStops = SHUTTER_BASE_NS.filter { it >= ex.lower && it <= maxShutter }
+                .ifEmpty { listOf(maxShutter.coerceIn(ex.lower, ex.upper)) }
             addChip(Param.ISO)
             addChip(Param.SHUTTER)
         }
@@ -1210,14 +1539,22 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         )
         awbItems = c.awbModes.filter { names.containsKey(it) }.sorted().map { it to names.getValue(it) }
         if (awbItems.size > 1) addChip(Param.WB)
+        kelvinStops = (2500..8000 step 250).toList()
+        if (c.hasManualWhiteBalance) addChip(Param.KELVIN)
         if (c.evRange.upper > c.evRange.lower) addChip(Param.EV)
 
         if (selected == null || !chips.containsKey(selected)) selected = chips.keys.firstOrNull()
+        ruler.visibility = if (chips.isEmpty()) View.GONE else View.VISIBLE
+        chipsRow.visibility = if (chips.isEmpty()) View.GONE else View.VISIBLE
         refreshChips()
+        updateProActions()
+        updateProSubmodeAppearance()
         if (proMode && chips.isEmpty()) {
-            proMode = false
-            modeSelector.select(0, false)
-            setProVisible(false)
+            if (c.videoProfiles.isEmpty()) {
+                proMode = false
+                modeSelector.select(0, false)
+                setProVisible(false)
+            }
         } else if (proMode) {
             selected?.let { selectParam(it) }
         }
@@ -1237,6 +1574,7 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             Param.ISO, Param.SHUTTER -> 44f
             Param.FOCUS -> 14f
             Param.WB -> 78f
+            Param.KELVIN -> 30f
             Param.EV -> 34f
         }
         ruler.onSelect = null
@@ -1251,6 +1589,7 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             Param.SHUTTER -> listOf("AUTO") + shutterStops.map { CameraCaps.fmtShutter(it) }
             Param.FOCUS -> listOf("AF") + focusLabels
             Param.WB -> awbItems.map { it.second }
+            Param.KELVIN -> listOf("AUTO") + kelvinStops.map { "${it}K" }
             Param.EV -> if (c == null) emptyList() else (c.evRange.lower..c.evRange.upper).map { evLabel(it) }
         }
     }
@@ -1264,6 +1603,9 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
             Param.FOCUS -> if (!s.manualFocus) 0 else
                 ((s.focusDiopters / c.minFocusDiopters * FOCUS_STEPS).roundToInt() + 1).coerceIn(1, FOCUS_STEPS + 1)
             Param.WB -> awbItems.indexOfFirst { it.first == s.awbMode }.coerceAtLeast(0)
+            Param.KELVIN -> s.manualKelvin?.let {
+                (kelvinStops.indices.minByOrNull { index -> abs(kelvinStops[index] - it) } ?: 0) + 1
+            } ?: 0
             Param.EV -> s.evIndex - c.evRange.lower
         }
     }
@@ -1291,14 +1633,17 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
         var s = engine.settings
         when (p) {
             Param.ISO -> s = if (idx == 0) s.copy(manualExposure = false)
-                else seeded(s).let { it.copy(iso = isoStops[idx - 1]) }
+                else seeded(s).let { it.copy(iso = isoStops[idx - 1], aeLocked = false) }
             Param.SHUTTER -> s = if (idx == 0) s.copy(manualExposure = false)
-                else seeded(s).let { it.copy(shutterNs = shutterStops[idx - 1]) }
-            Param.FOCUS -> s = if (idx == 0) s.copy(manualFocus = false) else s.copy(
+                else seeded(s).let { it.copy(shutterNs = shutterStops[idx - 1], aeLocked = false) }
+            Param.FOCUS -> s = if (idx == 0) s.copy(manualFocus = false, afLocked = false) else s.copy(
                 manualFocus = true,
+                afLocked = false,
                 focusDiopters = (idx - 1).toFloat() / FOCUS_STEPS * c.minFocusDiopters
             )
-            Param.WB -> s = s.copy(awbMode = awbItems[idx].first)
+            Param.WB -> s = s.copy(awbMode = awbItems[idx].first, manualKelvin = null)
+            Param.KELVIN -> s = if (idx == 0) s.copy(manualKelvin = null)
+                else s.copy(manualKelvin = kelvinStops[idx - 1], awbMode = CameraMetadata.CONTROL_AWB_MODE_AUTO)
             Param.EV -> s = s.copy(evIndex = c.evRange.lower + idx)
         }
         engine.settings = s
@@ -1319,11 +1664,179 @@ class MainActivity : Activity(), CameraEngine.Listener, TextureView.SurfaceTextu
                 focusLabels.getOrElse(j) { "MF" }
             } else "AF"
         )
-        chips[Param.WB]?.setValue(awbItems.firstOrNull { it.first == s.awbMode }?.second ?: "AUTO")
+        chips[Param.WB]?.setValue(
+            if (s.manualKelvin != null) "KELVIN" else awbItems.firstOrNull { it.first == s.awbMode }?.second ?: "AUTO"
+        )
+        chips[Param.KELVIN]?.setValue(s.manualKelvin?.let { "${it}K" } ?: "AUTO")
         chips[Param.EV]?.let {
             it.setValue(evLabel(s.evIndex))
             it.visibility = if (s.manualExposure && chips.containsKey(Param.ISO)) View.GONE else View.VISIBLE
         }
         if (selected == Param.EV && s.manualExposure && chips.containsKey(Param.ISO)) selectParam(Param.ISO)
+    }
+
+    private fun updateProSubmodeAppearance() {
+        val selectedBg = GradientDrawable().apply {
+            cornerRadius = dp(15f)
+            setColor(0x44332B1E)
+        }
+        proPhotoButton.background = if (!proVideoMode) selectedBg else null
+        proVideoButton.background = if (proVideoMode) selectedBg else null
+        proPhotoButton.setTextColor(if (!proVideoMode) Theme.ACCENT else Theme.TEXT_DIM)
+        proVideoButton.setTextColor(if (proVideoMode) Theme.ACCENT else Theme.TEXT_DIM)
+    }
+
+    private fun updateProActions() {
+        if (!::proActions.isInitialized) return
+        proActions.removeAllViews()
+        val c = current ?: return
+        val actions = ArrayList<Triple<String, Boolean, () -> Unit>>()
+        val canLockAe = c.hasAeLock && !engine.settings.manualExposure
+        val canLockAf = c.hasAfLock && !engine.settings.manualFocus
+        if (canLockAe || canLockAf) {
+            val locked = engine.settings.aeLocked || engine.settings.afLocked
+            actions.add(Triple("LOCK", locked) {
+                val enable = !locked
+                engine.settings = engine.settings.copy(
+                    aeLocked = enable && canLockAe,
+                    afLocked = enable && canLockAf
+                )
+                engine.updatePreview()
+                if (enable && canLockAf) engine.triggerFocusLock()
+                updateControlsForMode()
+            })
+        }
+        if (!proVideoMode && c.hasRaw && extensionModeFor(currentMode, c) == null) {
+            actions.add(Triple(if (engine.settings.raw) "RAW+JPG" else "JPEG", engine.settings.raw) {
+                toggleRaw()
+                updateProActions()
+            })
+        }
+        if (!proVideoMode && c.hasManualFocus) {
+            actions.add(Triple("PEAK", peakingEnabled) {
+                peakingEnabled = !peakingEnabled
+                focusPeaking.visibility = if (peakingEnabled) View.VISIBLE else View.GONE
+                focusPeaking.setPoints(FloatArray(0))
+                updateControlsForMode()
+            })
+        }
+        if (!proVideoMode && c.hasManualToneCurve) {
+            actions.add(Triple("TONE", engine.settings.highlights != 0f || engine.settings.shadows != 0f) {
+                showToneCurveControls()
+            })
+        }
+        if (hasLevelSensor) {
+            actions.add(Triple("LEVEL", levelEnabled) {
+                levelEnabled = !levelEnabled
+                updateControlsForMode()
+            })
+        }
+        actions.add(Triple("HIST", histogramEnabled) {
+            histogramEnabled = !histogramEnabled
+            updateControlsForMode()
+        })
+        actions.forEachIndexed { index, (label, active, action) ->
+            val button = TextView(this).apply {
+                text = label
+                textSize = 9f
+                typeface = Theme.MEDIUM
+                gravity = Gravity.CENTER
+                minHeight = dpi(34)
+                setTextColor(if (active) Theme.ACCENT else Color.WHITE)
+                background = GradientDrawable().apply {
+                    cornerRadius = dp(14f)
+                    setColor(if (active) 0x44332B1E else 0xAA151514.toInt())
+                }
+                setOnClickListener { action() }
+                addPressFeedback(0.96f)
+            }
+            proActions.addView(button, LinearLayout.LayoutParams(0, WRAP, 1f).apply {
+                if (index > 0) marginStart = dpi(4)
+            })
+        }
+    }
+
+    private fun findPeakingEdges(pixels: IntArray, width: Int, height: Int): FloatArray {
+        val points = ArrayList<Float>(512)
+        fun luma(index: Int): Int {
+            val color = pixels[index]
+            return (Color.red(color) * 0.2126f + Color.green(color) * 0.7152f +
+                Color.blue(color) * 0.0722f).toInt()
+        }
+        for (y in 1 until height - 1 step 2) {
+            for (x in 1 until width - 1 step 2) {
+                val i = y * width + x
+                val center = luma(i)
+                val highFrequency = abs(4 * center - luma(i - 1) - luma(i + 1) - luma(i - width) - luma(i + width))
+                if (highFrequency > 105) {
+                    points.add(x.toFloat() / width)
+                    points.add(y.toFloat() / height)
+                }
+            }
+        }
+        return points.toFloatArray()
+    }
+
+    private fun availableStorageLabel(): String {
+        val path = getExternalFilesDir(null)?.path ?: Environment.getExternalStorageDirectory().path
+        val free = StatFs(path).availableBytes
+        return "FREE %.1f GB".format(free / 1_000_000_000.0)
+    }
+
+    private fun showToneCurveControls() {
+        val c = current ?: return
+        if (!c.hasManualToneCurve) {
+            toast("Manual tone curves are not supported by this camera")
+            return
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dpi(20), dpi(8), dpi(20), dpi(4))
+        }
+        fun addToneControl(label: String, value: Float, update: (Float) -> Unit) {
+            val labelView = TextView(this).apply {
+                text = "$label  ${"%+.2f".format(value)}"
+                textSize = 13f
+                typeface = Theme.MEDIUM
+                setTextColor(Color.WHITE)
+            }
+            val slider = SeekBar(this).apply {
+                max = 200
+                progress = ((value.coerceIn(-1f, 1f) + 1f) * 100).roundToInt()
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                        if (!fromUser) return
+                        val next = progress / 100f - 1f
+                        labelView.text = "$label  ${"%+.2f".format(next)}"
+                        update(next)
+                        engine.updatePreview()
+                        updateProActions()
+                    }
+
+                    override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                    override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+                })
+            }
+            content.addView(labelView, LinearLayout.LayoutParams(MATCH, WRAP))
+            content.addView(slider, LinearLayout.LayoutParams(MATCH, WRAP).apply {
+                bottomMargin = dpi(12)
+            })
+        }
+        addToneControl("Shadows", engine.settings.shadows) {
+            engine.settings = engine.settings.copy(shadows = it)
+        }
+        addToneControl("Highlights", engine.settings.highlights) {
+            engine.settings = engine.settings.copy(highlights = it)
+        }
+        AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+            .setTitle("Tone curve")
+            .setView(content)
+            .setPositiveButton("Done", null)
+            .setNeutralButton("Reset") { _, _ ->
+                engine.settings = engine.settings.copy(highlights = 0f, shadows = 0f)
+                engine.updatePreview()
+                updateProActions()
+            }
+            .show()
     }
 }

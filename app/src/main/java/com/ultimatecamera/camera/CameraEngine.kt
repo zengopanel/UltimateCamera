@@ -19,8 +19,10 @@ import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.MeteringRectangle
+import android.hardware.camera2.params.TonemapCurve
 import android.hardware.camera2.params.ExtensionSessionConfiguration
 import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.RggbChannelVector
 import android.media.ExifInterface
 import android.media.Image
 import android.media.ImageReader
@@ -34,12 +36,16 @@ import android.media.MediaRecorder
 import android.util.Size
 import android.view.Surface
 import com.ultimatecamera.hardware.CameraCaps
+import com.ultimatecamera.hardware.VideoCodec
 import com.ultimatecamera.hardware.VideoProfile
 import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executor
+import kotlin.math.pow
+
+enum class VideoStabilization { AUTO, OFF, EIS, OIS }
 
 data class ManualSettings(
     val manualExposure: Boolean = false,
@@ -48,6 +54,9 @@ data class ManualSettings(
     val manualFocus: Boolean = false,
     val focusDiopters: Float = 0f,
     val awbMode: Int = CameraMetadata.CONTROL_AWB_MODE_AUTO,
+    val manualKelvin: Int? = null,
+    val aeLocked: Boolean = false,
+    val afLocked: Boolean = false,
     val evIndex: Int = 0,
     val raw: Boolean = false,
     val zoom: Float = 1f,
@@ -55,7 +64,13 @@ data class ManualSettings(
     val flashMode: Int = 0,
     val hdr: Boolean = false,
     val night: Boolean = false,
-    val stabilization: Boolean = true
+    val stabilization: VideoStabilization = VideoStabilization.AUTO,
+    val videoCodec: VideoCodec = VideoCodec.H264,
+    val videoBitrateFactor: Float = 1f,
+    val audioSampleRate: Int = 48_000,
+    val audioBitrate: Int = 192_000,
+    val highlights: Float = 0f,
+    val shadows: Float = 0f
 )
 
 /** Camera2 engine: preview, still capture (JPEG + optional DNG), zoom, tap-to-focus, manual controls. */
@@ -67,6 +82,8 @@ class CameraEngine(private val context: Context, private val listener: Listener)
         fun onRecordingChanged(recording: Boolean)
         fun onVideoSaved(uri: Uri)
         fun onCameraModeUnavailable()
+        fun onAudioLevel(amplitude: Int) {}
+        fun onCaptureReadout(iso: Int, exposureNs: Long, focusDiopters: Float) {}
     }
 
     private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -108,6 +125,22 @@ class CameraEngine(private val context: Context, private val listener: Listener)
     @Volatile
     var lastExposureNs = 0L
         private set
+    @Volatile
+    var lastFocusDiopters = 0f
+        private set
+
+    @Volatile
+    var audioLevel = 0
+        private set
+
+    private val audioMeter = object : Runnable {
+        override fun run() {
+            if (!recording) return
+            audioLevel = try { videoRecorder?.maxAmplitude ?: 0 } catch (_: IllegalStateException) { 0 }
+            listener.onAudioLevel(audioLevel)
+            handler?.postDelayed(this, 100)
+        }
+    }
 
     @Volatile
     private var regions: Array<MeteringRectangle>? = null
@@ -142,6 +175,11 @@ class CameraEngine(private val context: Context, private val listener: Listener)
                 ?: availablePhotoSizes.maxByOrNull { it.width.toLong() * it.height }
         } else photoSize?.takeIf { it in c.jpegSizes } ?: c.maxJpeg
         selectedVideoProfile = videoProfile?.takeIf { it in c.videoProfiles } ?: c.defaultVideoProfile()
+        selectedVideoProfile?.let { profile ->
+            if (settings.videoCodec !in c.videoCodecs[profile].orEmpty()) {
+                settings = settings.copy(videoCodec = c.videoCodecs[profile].orEmpty().firstOrNull() ?: VideoCodec.H264)
+            }
+        }
         this.extensionRequestKeys = this.extensionMode?.let { readExtensionRequestKeys(c.id, it) }.orEmpty()
         regions = null
         try {
@@ -313,6 +351,8 @@ class CameraEngine(private val context: Context, private val listener: Listener)
         ) {
             result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
             result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastExposureNs = it }
+            result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { lastFocusDiopters = it }
+            listener.onCaptureReadout(lastIso, lastExposureNs, lastFocusDiopters)
         }
     }
 
@@ -380,6 +420,52 @@ class CameraEngine(private val context: Context, private val listener: Listener)
         val c = caps ?: return
         if (profile !in c.videoProfiles || recording || recordingStarting) return
         selectedVideoProfile = profile
+        val codecs = c.videoCodecs[profile].orEmpty()
+        if (settings.videoCodec !in codecs) {
+            settings = settings.copy(videoCodec = codecs.firstOrNull() ?: VideoCodec.H264)
+        }
+        val maxExposure = 1_000_000_000L / profile.fps
+        if (settings.shutterNs > maxExposure) settings = settings.copy(shutterNs = maxExposure)
+    }
+
+    fun setVideoCodec(codec: VideoCodec) {
+        val profile = selectedVideoProfile ?: return
+        val c = caps ?: return
+        if (recording || recordingStarting) return
+        if (codec !in c.videoCodecs[profile].orEmpty()) {
+            listener.onMessage("${codec.label} is unavailable for this video size and frame rate")
+            return
+        }
+        settings = settings.copy(videoCodec = codec)
+    }
+
+    fun setVideoBitrateFactor(factor: Float) {
+        settings = settings.copy(videoBitrateFactor = factor.coerceIn(0.65f, 1.5f))
+    }
+
+    fun triggerFocusLock() {
+        val d = device ?: return
+        val s = session ?: return
+        val preview = previewSurface ?: return
+        val c = caps ?: return
+        if (!c.hasAfLock || settings.manualFocus) return
+        try {
+            val recordingSurface = if (recording) videoRecorder?.surface else null
+            val builder = d.createCaptureRequest(
+                if (recordingSurface != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+            )
+            builder.addTarget(preview)
+            recordingSurface?.let { builder.addTarget(it) }
+            applySettings(builder, preview = true, forVideo = videoMode)
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+            s.capture(builder.build(), null, handler)
+            updatePreview()
+        } catch (_: IllegalStateException) {
+            listener.onMessage("Focus lock is unavailable")
+        } catch (e: CameraAccessException) {
+            listener.onMessage("Could not lock focus: ${e.message}")
+        }
     }
 
     fun captureBurst(count: Int) {
@@ -407,6 +493,11 @@ class CameraEngine(private val context: Context, private val listener: Listener)
         val preview = previewSurface ?: return listener.onMessage("Preview not ready")
         val profile = selectedVideoProfile ?: return listener.onMessage("No supported video profile")
         if (recording || recordingStarting) return
+        val codec = settings.videoCodec
+        if (codec !in c.videoCodecs[profile].orEmpty()) {
+            listener.onMessage("${codec.label} is unavailable for this video size and frame rate")
+            return
+        }
 
         recordingStarting = true
         var uri: Uri? = null
@@ -428,16 +519,17 @@ class CameraEngine(private val context: Context, private val listener: Listener)
             if (withAudio) recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
             recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
             recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            recorder.setVideoEncoder(codec.recorderEncoder)
             if (withAudio) recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
             recorder.setVideoSize(profile.size.width, profile.size.height)
             recorder.setVideoFrameRate(profile.fps)
-            val bitrate = (profile.pixels * profile.fps * 0.12)
-                .toLong().coerceIn(8_000_000L, 120_000_000L)
+            val baseBitrate = profile.pixels * profile.fps * 0.12
+            val bitrate = (baseBitrate * settings.videoBitrateFactor)
+                .toLong().coerceIn(2_000_000L, 120_000_000L)
             recorder.setVideoEncodingBitRate(bitrate.toInt())
             if (withAudio) {
-                recorder.setAudioEncodingBitRate(128_000)
-                recorder.setAudioSamplingRate(48_000)
+                recorder.setAudioEncodingBitRate(settings.audioBitrate.coerceIn(64_000, 256_000))
+                recorder.setAudioSamplingRate(settings.audioSampleRate.coerceIn(32_000, 48_000))
             }
             recorder.setOrientationHint(jpegOrientation())
             recorder.setOutputFile(recorderDescriptor!!.fileDescriptor)
@@ -463,6 +555,8 @@ class CameraEngine(private val context: Context, private val listener: Listener)
                         recorder.start()
                         recordingStarting = false
                         recording = true
+                        audioLevel = 0
+                        if (withAudio) handler?.post(audioMeter)
                         listener.onRecordingChanged(true)
                     } catch (e: Exception) {
                         s.close()
@@ -493,6 +587,7 @@ class CameraEngine(private val context: Context, private val listener: Listener)
 
     private fun stopRecordingInternal(restartPreview: Boolean = true) {
         if (!recording && !recordingStarting) return
+        handler?.removeCallbacks(audioMeter)
         val wasRecording = recording
         recording = false
         recordingStarting = false
@@ -588,6 +683,9 @@ class CameraEngine(private val context: Context, private val listener: Listener)
             var ns = c.exposureRangeNs?.let { s.shutterNs.coerceIn(it.lower, it.upper) } ?: s.shutterNs
             // Keep the live preview fluid: long exposures are only used for the actual capture.
             if (preview) ns = minOf(ns, 100_000_000L)
+            if (forVideo) {
+                selectedVideoProfile?.let { ns = minOf(ns, 1_000_000_000L / it.fps) }
+            }
             b.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
             b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, ns)
         } else {
@@ -600,6 +698,7 @@ class CameraEngine(private val context: Context, private val listener: Listener)
             } else CameraMetadata.CONTROL_AE_MODE_ON
             b.set(CaptureRequest.CONTROL_AE_MODE, aeMode)
             b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, s.evIndex.coerceIn(c.evRange.lower, c.evRange.upper))
+            if (c.hasAeLock) b.set(CaptureRequest.CONTROL_AE_LOCK, s.aeLocked)
             regions?.let { if (c.maxAeRegions > 0) b.set(CaptureRequest.CONTROL_AE_REGIONS, it) }
         }
 
@@ -609,32 +708,94 @@ class CameraEngine(private val context: Context, private val listener: Listener)
         } else {
             b.set(
                 CaptureRequest.CONTROL_AF_MODE,
-                if (forVideo) CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO
-                else CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                when {
+                    s.afLocked && c.hasAfLock -> CameraMetadata.CONTROL_AF_MODE_AUTO
+                    forVideo -> CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                    else -> CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                }
             )
             regions?.let { if (c.maxAfRegions > 0) b.set(CaptureRequest.CONTROL_AF_REGIONS, it) }
         }
 
-        if (c.awbModes.contains(s.awbMode)) b.set(CaptureRequest.CONTROL_AWB_MODE, s.awbMode)
+        if (s.manualKelvin != null && c.hasManualWhiteBalance) {
+            val (red, green, blue) = kelvinGains(s.manualKelvin)
+            b.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+            b.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+            b.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(red, green, green, blue))
+            val colorTransform = chars?.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1)
+                ?: chars?.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2)
+            if (colorTransform != null) b.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, colorTransform)
+        } else if (c.awbModes.contains(s.awbMode)) {
+            b.set(CaptureRequest.CONTROL_AWB_MODE, s.awbMode)
+        }
+        if (c.hasManualToneCurve && (s.highlights != 0f || s.shadows != 0f)) {
+            b.set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)
+            b.set(CaptureRequest.TONEMAP_CURVE, toneCurve(c.toneCurvePoints, s.shadows, s.highlights))
+        }
         if (forVideo) {
             val profile = selectedVideoProfile
-            val fpsRange = profile?.let { selected ->
-                c.fpsRanges.filter { selected.fps in it.lower..it.upper }
-                    .minByOrNull { it.upper - it.lower }
-            }
+            val fpsRange = profile?.aeFpsRange
             fpsRange?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
-            val stabilized = s.stabilization
+            val stabilization = when (s.stabilization) {
+                VideoStabilization.AUTO -> when {
+                    c.eisSupported -> VideoStabilization.EIS
+                    c.oisSupported -> VideoStabilization.OIS
+                    else -> VideoStabilization.OFF
+                }
+                VideoStabilization.EIS -> if (c.eisSupported) VideoStabilization.EIS else VideoStabilization.OFF
+                VideoStabilization.OIS -> if (c.oisSupported) VideoStabilization.OIS else VideoStabilization.OFF
+                VideoStabilization.OFF -> VideoStabilization.OFF
+            }
             b.set(
                 CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                if (stabilized && c.eisSupported) CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                if (stabilization == VideoStabilization.EIS) CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
                 else CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
             )
             b.set(
                 CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                if (stabilized && c.oisSupported) CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
+                if (stabilization == VideoStabilization.OIS) CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
                 else CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
             )
         }
+    }
+
+    private fun kelvinGains(kelvin: Int): Triple<Float, Float, Float> {
+        val t = (kelvin.coerceIn(2500, 8000) / 100f)
+        val red: Float
+        val green: Float
+        val blue: Float
+        if (t <= 66f) {
+            red = 255f
+            green = (99.4708f * kotlin.math.ln(t) - 161.1196f).coerceIn(0f, 255f)
+            blue = if (t <= 19f) 0f else (138.5177f * kotlin.math.ln(t - 10f) - 305.0448f).coerceIn(0f, 255f)
+        } else {
+            red = (329.6987f * (t - 60f).pow(-0.1332f)).coerceIn(0f, 255f)
+            green = (288.1222f * (t - 60f).pow(-0.0755f)).coerceIn(0f, 255f)
+            blue = 255f
+        }
+        val g = green.coerceAtLeast(1f)
+        return Triple(
+            (g / red.coerceAtLeast(1f)).coerceIn(0.5f, 8f),
+            1f,
+            (g / blue.coerceAtLeast(1f)).coerceIn(0.5f, 8f)
+        )
+    }
+
+    private fun toneCurve(points: Int, shadows: Float, highlights: Float): TonemapCurve {
+        val curve = FloatArray(points.coerceAtLeast(2) * 2)
+        var previous = 0f
+        val shadow = shadows.coerceIn(-1f, 1f) * 0.18f
+        val highlight = highlights.coerceIn(-1f, 1f) * 0.18f
+        for (i in 0 until curve.size / 2) {
+            val x = i.toFloat() / (curve.size / 2 - 1)
+            val toe = (1f - x).pow(3)
+            val shoulder = x.pow(3)
+            val y = (x + shadow * toe - highlight * shoulder).coerceIn(previous, 1f)
+            curve[i * 2] = x
+            curve[i * 2 + 1] = y
+            previous = y
+        }
+        return TonemapCurve(curve, curve, curve)
     }
 
     /** Tap to focus / meter. u,v are 0..1 positions on the upright (display) preview. */

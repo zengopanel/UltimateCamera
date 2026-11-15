@@ -11,6 +11,7 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.os.Build
 import android.media.MediaRecorder
+import android.media.MediaCodecList
 import android.util.Range
 import android.util.Size
 import android.util.SizeF
@@ -19,12 +20,25 @@ import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.roundToInt
 
-data class VideoProfile(val size: Size, val fps: Int) {
+data class VideoProfile(
+    val size: Size,
+    val fps: Int,
+    val aeFpsRange: Range<Int> = Range(fps, fps)
+) {
     val label: String
-        get() = "${size.width}×${size.height} · ${fps}fps"
+        get() = "${size.width}×${size.height} · $frameRateLabel"
 
     val pixels: Long
         get() = size.width.toLong() * size.height
+
+    val frameRateLabel: String
+        get() = if (aeFpsRange.lower == aeFpsRange.upper) "${fps}fps"
+        else "${fps}fps target · AE ${aeFpsRange.lower}–${aeFpsRange.upper}"
+}
+
+enum class VideoCodec(val mimeType: String, val recorderEncoder: Int, val label: String) {
+    H264("video/avc", MediaRecorder.VideoEncoder.H264, "H.264"),
+    H265("video/hevc", MediaRecorder.VideoEncoder.HEVC, "H.265")
 }
 
 /** Everything the UI and engine need to know about one camera, read from the real hardware. */
@@ -40,6 +54,11 @@ data class CameraCaps(
     val rawSize: Size?,
     val hasRaw: Boolean,
     val hasManualSensor: Boolean,
+    val hasManualWhiteBalance: Boolean,
+    val hasManualToneCurve: Boolean,
+    val toneCurvePoints: Int,
+    val hasAeLock: Boolean,
+    val hasAfLock: Boolean,
     val isoRange: Range<Int>?,
     val exposureRangeNs: Range<Long>?,
     val minFocusDiopters: Float,
@@ -57,6 +76,7 @@ data class CameraCaps(
     val previewSizes: List<Size>,
     val jpegSizes: List<Size>,
     val videoProfiles: List<VideoProfile>,
+    val videoCodecs: Map<VideoProfile, List<VideoCodec>>,
     val sceneModes: List<Int>,
     val fpsRanges: List<Range<Int>>,
     val extensionModes: List<Int>,
@@ -65,6 +85,7 @@ data class CameraCaps(
     val extensionZoomModes: Set<Int>
 ) {
     val hasManualFocus get() = minFocusDiopters > 0f
+    val supportsVideoStabilization get() = eisSupported || oisSupported
     val isFront get() = facing == CameraCharacteristics.LENS_FACING_FRONT
     val supportsHdrScene get() = CameraMetadata.CONTROL_SCENE_MODE_HDR in sceneModes
     val supportsNightScene get() = CameraMetadata.CONTROL_SCENE_MODE_NIGHT in sceneModes
@@ -105,12 +126,19 @@ data class CameraCaps(
         isoRange?.let { if (hasManualSensor) appendLine("ISO: ${it.lower}-${it.upper}") }
         exposureRangeNs?.let { if (hasManualSensor) appendLine("Shutter: ${fmtShutter(it.lower)} - ${fmtShutter(it.upper)}") }
         appendLine("Manual focus: ${if (hasManualFocus) "yes" else "no"}")
+        appendLine("Manual Kelvin: ${if (hasManualWhiteBalance) "yes" else "no"}")
+        appendLine("Highlight/shadow tone curve: ${if (hasManualToneCurve) "yes" else "no"}")
+        appendLine("AE lock: ${if (hasAeLock) "yes" else "no"}  AF lock: ${if (hasAfLock) "yes" else "no"}")
         appendLine("Digital zoom: up to %.1fx".format(maxZoom))
         appendLine("Flash: ${if (hasFlash) "yes" else "no"}")
         appendLine("Focal length(s): ${focalLengths.joinToString { "%.2fmm".format(it) }}")
         sensorSizeMm?.let { appendLine("Sensor: %.2f x %.2f mm".format(it.width, it.height)) }
         appendLine("OIS: ${if (oisSupported) "yes" else "no"}  EIS: ${if (eisSupported) "yes" else "no"}")
-        appendLine("Video modes: ${videoProfiles.joinToString { it.label }.ifEmpty { "none" }}")
+        appendLine(
+            "Video modes: ${videoProfiles.joinToString {
+                "${it.label} (${videoCodecs[it].orEmpty().joinToString { codec -> codec.label }})"
+            }.ifEmpty { "none" }}"
+        )
         appendLine("HDR: ${if (supportsHdr) "yes" else "no"}  Night: ${if (supportsNight) "yes" else "no"}")
         appendLine("Portrait extension: ${if (supportsPortrait) "yes" else "no"}")
         if (physicalIds.isNotEmpty()) appendLine("Logical camera of: ${physicalIds.joinToString()}")
@@ -139,6 +167,9 @@ data class CameraCaps(
 
 class HardwareAnalyzer(context: Context) {
     private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    private val videoEncoders by lazy {
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { it.isEncoder }
+    }
 
     /** Reading characteristics does not require the CAMERA permission. */
     fun analyze(): List<CameraCaps> = manager.cameraIdList.mapNotNull { id ->
@@ -161,13 +192,14 @@ class HardwareAnalyzer(context: Context) {
             ?: listOf(jpeg)
         val videoSizes = map.getOutputSizes(MediaRecorder::class.java)?.toList().orEmpty()
         val fpsRanges = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.toList().orEmpty()
-        val supportedFps = listOf(24, 30, 60).filter { fps ->
-            fpsRanges.any { fps in it.lower..it.upper }
-        }
-        val videoProfiles = videoSizes.flatMap { size ->
+        val candidateVideoProfiles = videoSizes.flatMap { size ->
             val minFrameDuration = map.getOutputMinFrameDuration(MediaRecorder::class.java, size)
             val maxFpsForSize = if (minFrameDuration > 0L) (1_000_000_000L / minFrameDuration).toInt() else Int.MAX_VALUE
-            supportedFps.filter { it <= maxFpsForSize }.map { fps -> VideoProfile(size, fps) }
+            val standardFps = listOf(24, 25, 30, 50, 60, 90, 120, 240)
+            fpsRanges.sortedBy { it.upper - it.lower }.flatMap { range ->
+                standardFps.filter { it in range.lower..range.upper && it <= maxFpsForSize }
+                    .map { fps -> VideoProfile(size, fps, range) }
+            }
         }.distinctBy { Triple(it.size.width, it.size.height, it.fps) }
             .sortedWith(compareByDescending<VideoProfile> { it.pixels }.thenByDescending { it.fps })
         val sceneModes = c.get(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)?.toList().orEmpty()
@@ -213,6 +245,28 @@ class HardwareAnalyzer(context: Context) {
         val rawSize = map.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width.toLong() * it.height }
         val hasRaw = CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW in caps && rawSize != null
         val manual = CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR in caps
+        val requestKeys = c.get(CameraCharacteristics.REQUEST_AVAILABLE_REQUEST_KEYS)?.toSet().orEmpty()
+        val awbModes = c.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toList().orEmpty()
+        val hasColorTransform = c.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1) != null ||
+            c.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2) != null
+        val manualWhiteBalance =
+            CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING in caps &&
+                CameraMetadata.CONTROL_AWB_MODE_OFF in awbModes &&
+                hasColorTransform &&
+                CaptureRequest.CONTROL_AWB_MODE in requestKeys &&
+                CaptureRequest.COLOR_CORRECTION_MODE in requestKeys &&
+                CaptureRequest.COLOR_CORRECTION_GAINS in requestKeys &&
+                CaptureRequest.COLOR_CORRECTION_TRANSFORM in requestKeys
+        val toneCurvePoints = c.get(CameraCharacteristics.TONEMAP_MAX_CURVE_POINTS) ?: 0
+        val toneModes = c.get(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES)?.toSet().orEmpty()
+        val manualToneCurve =
+            CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE in toneModes &&
+                toneCurvePoints >= 2 &&
+                CaptureRequest.TONEMAP_MODE in requestKeys &&
+                CaptureRequest.TONEMAP_CURVE in requestKeys
+        val afModes = c.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.toSet().orEmpty()
+        val aeLock = c.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true
+        val afLock = CameraMetadata.CONTROL_AF_MODE_AUTO in afModes
 
         val ev = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE) ?: Range(0, 0)
         val evStep = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toFloat() ?: 0f
@@ -220,6 +274,13 @@ class HardwareAnalyzer(context: Context) {
             ?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true
         val ois = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
             ?.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
+        val candidateVideoCodecs = candidateVideoProfiles.associateWith { profile ->
+            VideoCodec.values().filter { codec ->
+                supportsVideoCodec(codec, profile)
+            }
+        }
+        val videoProfiles = candidateVideoProfiles.filter { !candidateVideoCodecs[it].isNullOrEmpty() }
+        val videoCodecs = videoProfiles.associateWith { candidateVideoCodecs.getValue(it) }
         val active = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
             ?: Rect(0, 0, jpeg.width, jpeg.height)
 
@@ -235,12 +296,17 @@ class HardwareAnalyzer(context: Context) {
             rawSize = if (hasRaw) rawSize else null,
             hasRaw = hasRaw,
             hasManualSensor = manual,
+            hasManualWhiteBalance = manualWhiteBalance,
+            hasManualToneCurve = manualToneCurve,
+            toneCurvePoints = toneCurvePoints,
+            hasAeLock = aeLock,
+            hasAfLock = afLock,
             isoRange = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE),
             exposureRangeNs = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE),
             minFocusDiopters = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f,
             evRange = ev,
             evStep = evStep,
-            awbModes = c.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toList() ?: emptyList(),
+            awbModes = awbModes,
             hardwareLevel = c.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ?: CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY,
             oisSupported = ois,
             eisSupported = eis,
@@ -252,6 +318,7 @@ class HardwareAnalyzer(context: Context) {
             previewSizes = map.getOutputSizes(SurfaceTexture::class.java)?.toList() ?: emptyList(),
             jpegSizes = jpegSizes,
             videoProfiles = videoProfiles,
+            videoCodecs = videoCodecs,
             sceneModes = sceneModes,
             fpsRanges = fpsRanges,
             extensionModes = extensionModes,
@@ -260,4 +327,18 @@ class HardwareAnalyzer(context: Context) {
             extensionZoomModes = extensionZoomModes
         )
     }
+
+    private fun supportsVideoCodec(codec: VideoCodec, profile: VideoProfile): Boolean =
+        try {
+            videoEncoders.any { info ->
+                codec.mimeType in info.supportedTypes && info.getCapabilitiesForType(codec.mimeType)
+                    .videoCapabilities?.areSizeAndRateSupported(
+                        profile.size.width,
+                        profile.size.height,
+                        profile.fps.toDouble()
+                    ) == true
+            }
+        } catch (_: IllegalArgumentException) {
+            false
+        }
 }
