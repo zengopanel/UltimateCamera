@@ -677,12 +677,14 @@ class CameraEngine(private val context: Context, private val listener: Listener)
             else CameraMetadata.FLASH_MODE_OFF
         )
 
+        val ev = s.evIndex.coerceIn(c.evRange.lower, c.evRange.upper)
+        b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ev)
+        if (c.hasAeLock) b.set(CaptureRequest.CONTROL_AE_LOCK, s.aeLocked)
+
         if (s.manualExposure && c.hasManualSensor) {
             b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
             val iso = c.isoRange?.let { s.iso.coerceIn(it.lower, it.upper) } ?: s.iso
             var ns = c.exposureRangeNs?.let { s.shutterNs.coerceIn(it.lower, it.upper) } ?: s.shutterNs
-            // Keep the live preview fluid: long exposures are only used for the actual capture.
-            if (preview) ns = minOf(ns, 100_000_000L)
             if (forVideo) {
                 selectedVideoProfile?.let { ns = minOf(ns, 1_000_000_000L / it.fps) }
             }
@@ -697,8 +699,6 @@ class CameraEngine(private val context: Context, private val listener: Listener)
                 }
             } else CameraMetadata.CONTROL_AE_MODE_ON
             b.set(CaptureRequest.CONTROL_AE_MODE, aeMode)
-            b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, s.evIndex.coerceIn(c.evRange.lower, c.evRange.upper))
-            if (c.hasAeLock) b.set(CaptureRequest.CONTROL_AE_LOCK, s.aeLocked)
             regions?.let { if (c.maxAeRegions > 0) b.set(CaptureRequest.CONTROL_AE_REGIONS, it) }
         }
 
@@ -717,8 +717,10 @@ class CameraEngine(private val context: Context, private val listener: Listener)
             regions?.let { if (c.maxAfRegions > 0) b.set(CaptureRequest.CONTROL_AF_REGIONS, it) }
         }
 
-        if (s.manualKelvin != null && c.hasManualWhiteBalance) {
-            val (red, green, blue) = kelvinGains(s.manualKelvin)
+        val awbLocked = s.manualKelvin != null && c.hasManualWhiteBalance
+        if (awbLocked) {
+            b.set(CaptureRequest.CONTROL_AWB_LOCK, true)
+            val (red, green, blue) = kelvinGains(s.manualKelvin!!)
             b.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
             b.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
             b.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(red, green, green, blue))
@@ -727,6 +729,7 @@ class CameraEngine(private val context: Context, private val listener: Listener)
             if (colorTransform != null) b.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, colorTransform)
         } else if (c.awbModes.contains(s.awbMode)) {
             b.set(CaptureRequest.CONTROL_AWB_MODE, s.awbMode)
+            b.set(CaptureRequest.CONTROL_AWB_LOCK, false)
         }
         if (c.hasManualToneCurve && (s.highlights != 0f || s.shadows != 0f)) {
             b.set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)
